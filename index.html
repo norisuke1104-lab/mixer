@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>Audio Mixer Prototype</title>
+    <style>
+        body { font-family: sans-serif; padding: 20px; background: #f0f0f0; }
+        .container { max-width: 800px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; }
+        
+        /* 教師用ステージ画面 */
+        #stage {
+            width: 100%; height: 400px;
+            background: #333;
+            position: relative;
+            margin-top: 20px;
+            border-radius: 8px;
+            overflow: hidden;
+            display: none; /* 初期状態は非表示 */
+        }
+        .student-dot {
+            width: 60px; height: 60px;
+            background: #4CAF50;
+            border-radius: 50%;
+            position: absolute;
+            top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            cursor: grab;
+            color: white;
+            display: flex; flex-direction: column;
+            align-items: center; justify-content: center;
+            font-size: 12px;
+            user-select: none;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.3);
+        }
+        .student-dot.muted { background: #999; }
+        
+        .controls { margin-top: 5px; }
+        button { padding: 10px 20px; cursor: pointer; }
+        .status { margin-top: 10px; color: #666; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>教室オーディオミキサー (プロトタイプ)</h2>
+    
+    <div id="setup">
+        <p>役割を選択してください:</p>
+        <button onclick="startTeacher()">👨‍🏫 教師として参加</button>
+        <hr>
+        <button onclick="startStudent(1)">学生 1 として参加</button>
+        <button onclick="startStudent(2)">学生 2 として参加</button>
+        <button onclick="startStudent(3)">学生 3 として参加</button>
+    </div>
+
+    <div id="status" class="status"></div>
+
+    <div id="teacher-ui" style="display:none;">
+        <p>生徒のアイコンをドラッグすると、音の聞こえる位置が変わります。<br>クリックでミュート切替。</p>
+        <div id="stage">
+            </div>
+    </div>
+</div>
+
+<script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-database-compat.js"></script>
+
+<script>
+    // ▼▼▼ ここにFirebaseのConfigを貼り付けてください ▼▼▼
+    const firebaseConfig = {
+        apiKey: "AIzaSyD2uw6yksG-wCJO7fcC-if0EBUoZtc6LuA",
+    authDomain: "mixer-2d0bc.firebaseapp.com",
+    databaseURL: "https://mixer-2d0bc-default-rtdb.firebaseio.com",
+    projectId: "mixer-2d0bc",
+    storageBucket: "mixer-2d0bc.firebasestorage.app",
+    messagingSenderId: "937705960629",
+    appId: "1:937705960629:web:4865e399a56ad46a58bafc",
+    measurementId: "G-W8YY4M7H8F"
+    };
+    // ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+
+    firebase.initializeApp(firebaseConfig);
+    const database = firebase.database();
+
+    // グローバル変数
+    let localStream;
+    let audioContext;
+    const peerConnections = {}; // 生徒IDごとの接続管理
+    const audioNodes = {};      // 生徒IDごとの音声ノード管理
+    
+    // WebRTC設定 (GoogleのパブリックSTUNサーバー)
+    const peerConnectionConfig = {
+        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+    };
+
+    // ■■■ 教師側の処理 ■■■
+    async function startTeacher() {
+        document.getElementById('setup').style.display = 'none';
+        document.getElementById('teacher-ui').style.display = 'block';
+        document.getElementById('stage').style.display = 'block';
+        updateStatus("音声エンジン起動中... (画面をクリックしてください)");
+
+        // AudioContextはユーザージェスチャーが必要なので、クリック待ちなどにしても良いですが
+        // ここでは即時生成を試みます
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        
+        updateStatus("生徒の接続を待機しています...");
+
+        // 生徒1〜3からのシグナリングを監視
+        [1, 2, 3].forEach(id => setupTeacherSignaling(id));
+    }
+
+    function setupTeacherSignaling(studentId) {
+        const studentRef = database.ref(`rooms/demo/${studentId}`);
+        
+        // 生徒からOfferが来たらAnswerを返す
+        studentRef.child('offer').on('value', async snapshot => {
+            const offer = snapshot.val();
+            if (!offer) return;
+
+            // 新しい接続の準備
+            const pc = new RTCPeerConnection(peerConnectionConfig);
+            peerConnections[studentId] = pc;
+
+            // ICE Candidateの処理
+            pc.onicecandidate = event => {
+                if (event.candidate) {
+                    studentRef.child('teacherCandidate').push(event.candidate.toJSON());
+                }
+            };
+
+            // ★重要：音声ストリームを受け取った時の処理
+            pc.ontrack = event => {
+                setupAudioNodes(studentId, event.streams[0]);
+            };
+
+            await pc.setRemoteDescription(new RTCSessionDescription(offer));
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            
+            // AnswerをFirebaseに書き込む
+            studentRef.child('answer').set({
+                type: answer.type,
+                sdp: answer.sdp
+            });
+
+            // 生徒側のCandidateを監視
+            studentRef.child('studentCandidate').on('child_added', snap => {
+                const candidate = new RTCIceCandidate(snap.val());
+                pc.addIceCandidate(candidate);
+            });
+            
+            updateStatus(`生徒 ${studentId} が接続しました`);
+            createStudentModule(studentId); // 画面に○を表示
+        });
+    }
+
+    // Web Audio API: 音声処理グラフの構築
+    function setupAudioNodes(id, stream) {
+        if (audioContext.state === 'suspended') audioContext.resume();
+
+        const source = audioContext.createMediaStreamSource(stream);
+        const panner = audioContext.createPanner(); // 3D音響ノード
+        const gain = audioContext.createGain();     // 音量ノード
+
+        // Panner設定 (距離減衰の設定など)
+        panner.panningModel = 'HRTF';
+        panner.distanceModel = 'linear';
+        
+        // 接続: Source -> Panner -> Gain -> スピーカー
+        source.connect(panner);
+        panner.connect(gain);
+        gain.connect(audioContext.destination);
+
+        // 管理用に保存
+        audioNodes[id] = { panner, gain, isMuted: false };
+    }
+
+    // UI: 生徒モジュールの生成とドラッグ処理
+    function createStudentModule(id) {
+        const stage = document.getElementById('stage');
+        // 既に存在すれば削除
+        const existing = document.getElementById(`student-${id}`);
+        if(existing) existing.remove();
+
+        const dot = document.createElement('div');
+        dot.id = `student-${id}`;
+        dot.className = 'student-dot';
+        dot.innerHTML = `<span>Student ${id}</span>`;
+        
+        // 初期位置: 中央
+        dot.style.left = '50%';
+        dot.style.top = '50%';
+        stage.appendChild(dot);
+
+        // ドラッグ機能
+        let isDragging = false;
+        dot.addEventListener('mousedown', () => isDragging = true);
+        window.addEventListener('mouseup', () => isDragging = false);
+        
+        stage.addEventListener('mousemove', (e) => {
+            if (!isDragging) return;
+            
+            // ステージ内の座標計算
+            const rect = stage.getBoundingClientRect();
+            let x = e.clientX - rect.left;
+            let y = e.clientY - rect.top;
+
+            // 範囲制限
+            x = Math.max(0, Math.min(x, rect.width));
+            y = Math.max(0, Math.min(y, rect.height));
+
+            // DOM移動
+            dot.style.left = x + 'px';
+            dot.style.top = y + 'px';
+
+            // ★ Web Audio API Panner更新 ★
+            // 画面の中央を(0,0,0)とし、左右をX、奥行きをZにマッピング
+            // Web Audioの座標系: 右が+x, 手前が+z
+            const pannerX = (x / rect.width - 0.5) * 10; // -5 〜 5
+            const pannerZ = (y / rect.height - 0.5) * 10; // -5 〜 5
+            
+            if (audioNodes[id]) {
+                const p = audioNodes[id].panner;
+                // positionX, positionY, positionZ
+                if(p.positionX) { // 新しいブラウザ仕様
+                    p.positionX.value = pannerX;
+                    p.positionZ.value = pannerZ;
+                } else { // 古い仕様
+                    p.setPosition(pannerX, 0, pannerZ);
+                }
+            }
+        });
+
+        // クリックでミュート
+        dot.addEventListener('dblclick', () => { // ドラッグと区別するためダブルクリック推奨ですが今回は簡易的に
+           // 実装省略（必要ならclickでフラグ管理）
+        });
+        
+        dot.addEventListener('click', (e) => {
+             // ドラッグ終了直後のクリック発火を防ぐ簡易判定が必要ですが、今回は単純にトグル
+             if(audioNodes[id]) {
+                 audioNodes[id].isMuted = !audioNodes[id].isMuted;
+                 audioNodes[id].gain.gain.value = audioNodes[id].isMuted ? 0 : 1;
+                 dot.classList.toggle('muted');
+             }
+        });
+    }
+
+
+    // ■■■ 生徒側の処理 ■■■
+    async function startStudent(id) {
+        document.getElementById('setup').style.display = 'none';
+        updateStatus(`学生 ${id} としてマイクを準備中...`);
+
+        // マイク取得
+        try {
+            localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+        } catch(e) {
+            alert("マイクの許可が必要です");
+            return;
+        }
+
+        const pc = new RTCPeerConnection(peerConnectionConfig);
+        
+        // マイク音声を接続に追加
+        localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+
+        // ICE Candidate処理
+        const studentRef = database.ref(`rooms/demo/${id}`);
+        // 初期化（以前のデータを消す）
+        await studentRef.remove();
+
+        pc.onicecandidate = event => {
+            if (event.candidate) {
+                studentRef.child('studentCandidate').push(event.candidate.toJSON());
+            }
+        };
+
+        // Offer作成
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+
+        // FirebaseへOffer送信
+        await studentRef.child('offer').set({
+            type: offer.type,
+            sdp: offer.sdp
+        });
+
+        updateStatus(`接続待機中... (ID: ${id})`);
+
+        // 教師からのAnswerを待つ
+        studentRef.child('answer').on('value', async snapshot => {
+            const answer = snapshot.val();
+            if (!answer) return;
+            if (pc.currentRemoteDescription) return; // 既に接続済みなら無視
+
+            await pc.setRemoteDescription(new RTCSessionDescription(answer));
+            updateStatus("接続完了！ 音声を送信中");
+        });
+
+        // 教師のCandidateを監視
+        studentRef.child('teacherCandidate').on('child_added', snap => {
+            const candidate = new RTCIceCandidate(snap.val());
+            pc.addIceCandidate(candidate);
+        });
+    }
+
+    function updateStatus(msg) {
+        document.getElementById('status').innerText = msg;
+    }
+</script>
+
+</body>
+</html>
